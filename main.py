@@ -19,9 +19,15 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://sonarclip.ru"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://sonarclip.ru",
+        "https://www.sonarclip.ru",
+        "https://clipforge-blue-eta.vercel.app",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
 
