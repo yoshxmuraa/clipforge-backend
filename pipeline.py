@@ -7,8 +7,8 @@ from pathlib import Path
 from logger import log_info, log_error, log_warning
 from db import update_task, add_used_minutes, create_user_clip
 
-TEMP_DIR = Path("temp").resolve()
-TEMP_DIR.mkdir(exist_ok=True)
+TEMP_DIR = Path("/tmp/sonarclip_temp")
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 GENAPI_BASE_URL = os.getenv("GENAPI_BASE_URL", "https://proxy.gen-api.ru/v1")
 GENAPI_MODEL = "gemini-3-8-flash"
