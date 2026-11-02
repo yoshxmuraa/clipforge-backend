@@ -1,12 +1,15 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
 from typing import Optional, List
+import os
 import time
 import threading
-from pipeline import run_pipeline_with_task, TEMP_DIR, PLANS
+import uuid
+import shutil
+from pipeline import run_pipeline_with_task, TEMP_DIR, UPLOAD_DIR, PLANS
 from db import (
     get_profile, get_profile_by_email, create_profile,
     create_task, get_task, get_active_task,
@@ -37,7 +40,7 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class ProcessRequest(BaseModel):
+class ProcessUrlRequest(BaseModel):
     url: str
 
 
@@ -132,12 +135,18 @@ def active_task(authorization: Optional[str] = Header(None)):
     }
 
 
-@app.post("/process")
-def process_video(req: ProcessRequest, authorization: Optional[str] = Header(None)):
+@app.post("/upload")
+async def upload_video(
+    file: UploadFile = File(...),
+    mirror: bool = Form(False),
+    speed_up: bool = Form(False),
+    subtitles: bool = Form(True),
+    authorization: Optional[str] = Header(None),
+):
     payload = get_current_user(authorization)
     user_id = payload["sub"]
 
-    log_info(f"[api] POST /process | user={user_id}")
+    log_info(f"[api] POST /upload | user={user_id} | file={file.filename}")
 
     profile = get_profile(user_id)
     if not profile:
@@ -149,20 +158,54 @@ def process_video(req: ProcessRequest, authorization: Optional[str] = Header(Non
     limit = plan_config["minutes"]
 
     if used >= limit:
+        raise HTTPException(status_code=403, detail=f"Лимит исчерпан. Использовано {used:.1f} из {limit} минут.")
+
+    file_id = str(uuid.uuid4())
+    ext = Path(file.filename).suffix or ".mp4"
+    save_path = str(UPLOAD_DIR / f"{file_id}{ext}")
+
+    try:
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        log_error(f"[upload] Save error: {e}")
+        raise HTTPException(status_code=500, detail="Не удалось сохранить файл")
+
+    file_size_mb = os.path.getsize(save_path) / 1024 / 1024
+    log_info(f"[upload] Сохранён: {save_path} ({file_size_mb:.1f}MB)")
+
+    from pipeline import get_video_duration
+    video_duration = get_video_duration(save_path)
+    duration_minutes = video_duration / 60
+
+    log_info(f"[upload] Длина: {duration_minutes:.1f} мин")
+
+    if duration_minutes > plan_config["max_file_minutes"]:
+        os.remove(save_path)
         raise HTTPException(
-            status_code=403,
-            detail=f"Лимит исчерпан. Использовано {used:.1f} из {limit} минут."
+            status_code=400,
+            detail=f"Файл длиннее {plan_config['max_file_minutes']} минут. Тариф: {plan_config['name']}."
         )
 
-    task = create_task(user_id, req.url, user_plan)
+    if used + duration_minutes > limit:
+        os.remove(save_path)
+        remaining = limit - used
+        raise HTTPException(
+            status_code=403,
+            detail=f"Не хватит минут. Осталось: {remaining:.1f}, нужно: {duration_minutes:.1f}."
+        )
+
+    task = create_task(user_id, f"file:{file.filename}", user_plan)
     if not task:
+        os.remove(save_path)
         raise HTTPException(status_code=500, detail="Не удалось создать задачу")
 
     task_id = str(task["id"])
 
     def run_async():
         try:
-            run_pipeline_with_task(task_id, req.url, user_plan, user_id)
+            run_pipeline_with_task(task_id, save_path, user_plan, user_id,
+                                    mirror=mirror, speed_up=speed_up, subtitles=subtitles)
         except Exception as e:
             log_error(f"[async] {e}")
 

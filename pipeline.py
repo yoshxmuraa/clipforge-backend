@@ -2,6 +2,7 @@ import os
 import subprocess
 import json
 import time
+import base64
 from openai import OpenAI
 from pathlib import Path
 from logger import log_info, log_error, log_warning
@@ -10,27 +11,37 @@ from db import update_task, add_used_minutes, create_user_clip
 TEMP_DIR = Path("/tmp/sonarclip_temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+UPLOAD_DIR = Path("/data/uploads") if Path("/data").exists() else Path("/tmp/sonarclip_uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 GENAPI_BASE_URL = os.getenv("GENAPI_BASE_URL", "https://proxy.gen-api.ru/v1")
 GENAPI_MODEL = "gemini-3-8-flash"
-
-MAX_VIDEO_DURATION = 900
 
 PLANS = {
     "free": {
         "name": "Бесплатно", "price": 0, "minutes": 15,
         "max_clip_duration": 60, "watermark": True, "kinetic_subs": False,
+        "max_file_minutes": 15, "max_clips": 2, "allow_url": False,
+    },
+    "start": {
+        "name": "Старт", "price": 100, "minutes": 40,
+        "max_clip_duration": 60, "watermark": False, "kinetic_subs": True,
+        "max_file_minutes": 40, "max_clips": 10, "allow_url": False,
     },
     "pro": {
         "name": "Про", "price": 500, "minutes": 300,
         "max_clip_duration": 180, "watermark": False, "kinetic_subs": True,
+        "max_file_minutes": 60, "max_clips": 15, "allow_url": True,
     },
     "business": {
         "name": "Бизнес", "price": 1500, "minutes": 1000,
         "max_clip_duration": 300, "watermark": False, "kinetic_subs": True,
+        "max_file_minutes": 120, "max_clips": 20, "allow_url": True,
     },
     "agency": {
         "name": "Агентство", "price": 5000, "minutes": 5000,
         "max_clip_duration": 900, "watermark": False, "kinetic_subs": True,
+        "max_file_minutes": 300, "max_clips": 40, "allow_url": True,
     },
 }
 
@@ -52,9 +63,17 @@ def download_video(url: str, output_path: str):
     if proxy:
         cmd += ["--proxy", proxy]
 
-    cookies_path = "cookies.txt"
-    if os.path.exists(cookies_path):
-        cmd += ["--cookies", cookies_path]
+    cookies_b64 = os.getenv("YT_COOKIES_BASE64")
+    if cookies_b64:
+        try:
+            cookies_data = base64.b64decode(cookies_b64).decode('utf-8')
+            cookies_path = str(TEMP_DIR / "cookies.txt")
+            with open(cookies_path, "w", encoding="utf-8") as f:
+                f.write(cookies_data)
+            cmd += ["--cookies", cookies_path]
+            log_info("[download] Cookies decoded from Base64")
+        except Exception as e:
+            log_error(f"[download] Cookies decode error: {e}")
 
     cmd += [
         "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
@@ -73,12 +92,10 @@ def download_video(url: str, output_path: str):
         err = e.stderr.decode('utf-8', errors='ignore')
         if "Video unavailable" in err or "Private video" in err:
             raise PipelineError("Видео недоступно или приватное")
-        if "This video is not available" in err:
-            raise PipelineError("Видео недоступно в твоём регионе")
         if "Sign in" in err or "bot" in err.lower():
-            raise PipelineError("YouTube требует авторизацию. Попробуй позже или с VPN.")
+            raise PipelineError("YouTube требует авторизацию.")
         log_error(f"[download] Ошибка: {err[-500:]}")
-        raise PipelineError("Не удалось скачать видео. Проверь ссылку.")
+        raise PipelineError("Не удалось скачать видео.")
 
 
 def get_video_duration(video_path: str) -> float:
@@ -95,17 +112,6 @@ def get_video_duration(video_path: str) -> float:
         return 0.0
 
 
-def check_duration_before_download(url: str) -> float:
-    cmd = ["yt-dlp", "--no-download", "--print", "%(duration)s", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        val = result.stdout.strip().split("\n")[-1]
-        return float(val)
-    except Exception as e:
-        log_warning(f"[check] Не удалось получить длину: {e}")
-        return 0.0
-
-
 def transcribe(video_path: str):
     log_info(f"[transcribe] Начало")
     start = time.time()
@@ -114,21 +120,21 @@ def transcribe(video_path: str):
     model = load_model("base")
     result = model.transcribe(video_path, word_timestamps=True)
 
-    log_info(f"[transcribe] Готово за {time.time()-start:.1f}с, сегментов: {len(result['segments'])}")
+    log_info(f"[transcribe] Готово за {time.time()-start:.1f}с")
     return result
 
 
-def calculate_num_clips(video_duration: float, max_clip_duration: int = 180) -> int:
-    if video_duration < 30:
-        return 1
-    elif video_duration < 60:
-        return 2
-    elif video_duration < 180:
-        return 5
+def calculate_num_clips(video_duration: float, max_clips: int) -> int:
+    if video_duration < 60:
+        return min(2, max_clips)
+    elif video_duration < 300:
+        return min(5, max_clips)
     elif video_duration < 600:
-        return 8
+        return min(10, max_clips)
+    elif video_duration < 1800:
+        return min(15, max_clips)
     else:
-        return 10
+        return min(25, max_clips)
 
 
 def find_interesting_moments(transcript: str, num_clips: int,
@@ -138,22 +144,14 @@ def find_interesting_moments(transcript: str, num_clips: int,
 
     api_key = os.getenv("GENAPI_API_KEY")
     if not api_key:
-        raise PipelineError("API-ключ не настроен на сервере")
+        raise PipelineError("API-ключ не настроен")
 
     client = OpenAI(api_key=api_key, base_url=GENAPI_BASE_URL)
 
     duration_int = int(video_duration)
     max_dur = min(max_clip_duration, duration_int)
 
-    if num_clips == 1:
-        prompt = f"""Ты — редактор вирусных видео для TikTok и Shorts.
-Длина видео: {duration_int} сек. Макс длина клипа: {max_dur} сек.
-Верни ОДИН момент — самое интересное место.
-JSON без markdown: [{{"start": 0.0, "end": {min(max_dur, duration_int)}, "title": "Заголовок"}}]
-Транскрипт:
-{transcript}"""
-    else:
-        prompt = f"""Ты — редактор вирусных видео для TikTok и Shorts.
+    prompt = f"""Ты — редактор вирусных видео для TikTok и Shorts.
 Длина видео: {duration_int} сек. Макс длина клипа: {max_dur} сек.
 ВАЖНО: start и end не превышают {duration_int}. Длина клипа не превышает {max_dur} сек.
 Найди {num_clips} самых интересных моментов.
@@ -186,8 +184,6 @@ JSON без markdown:
 
         log_info(f"[gemini] Готово за {time.time()-start:.1f}с, моментов: {len(cleaned)}")
         return cleaned
-    except json.JSONDecodeError:
-        raise PipelineError("AI вернул некорректный ответ. Попробуй ещё раз.")
     except Exception as e:
         log_error(f"[gemini] Ошибка: {e}")
         raise PipelineError("Ошибка AI-анализа.")
@@ -228,6 +224,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"Dialogue: 0,0:00:00.00,{format_ass_time(total_duration)},Watermark,,0,0,0,,SonarClip"
         )
 
+    if not kinetic_subs:
+        return output_path
+
     for seg in segments:
         if seg["end"] <= clip_start or seg["start"] >= clip_end:
             continue
@@ -241,35 +240,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if not words:
             continue
 
-        if kinetic_subs:
-            for i in range(0, len(words), 2):
-                group = words[i:i + 2]
-                if not group:
-                    continue
-                for j, active in enumerate(group):
-                    w_start = max(active["start"], clip_start) - clip_start
-                    w_end = min(active["end"], clip_end) - clip_start
+        for i in range(0, len(words), 2):
+            group = words[i:i + 2]
+            if not group:
+                continue
+            for j, active in enumerate(group):
+                w_start = max(active["start"], clip_start) - clip_start
+                w_end = min(active["end"], clip_end) - clip_start
 
-                    parts = []
-                    for k, w in enumerate(group):
-                        t = w["word"].strip().upper()
-                        if k == j:
-                            parts.append(f"{{\\c&H00FFFF&\\fscx115\\fscy115}}{t}{{\\r}}")
-                        else:
-                            parts.append(t)
+                parts = []
+                for k, w in enumerate(group):
+                    t = w["word"].strip().upper()
+                    if k == j:
+                        parts.append(f"{{\\c&H00FFFF&\\fscx115\\fscy115}}{t}{{\\r}}")
+                    else:
+                        parts.append(t)
 
-                    events.append(
-                        f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},"
-                        f"Default,,0,0,0,,{' '.join(parts)}"
-                    )
-        else:
-            seg_start = max(seg["start"], clip_start) - clip_start
-            seg_end = min(seg["end"], clip_end) - clip_start
-            text = seg["text"].strip().upper()
-            if text:
                 events.append(
-                    f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(seg_end)},"
-                    f"Default,,0,0,0,,{text}"
+                    f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},"
+                    f"Default,,0,0,0,,{' '.join(parts)}"
                 )
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -278,24 +267,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return output_path
 
 
-def cut_clip(video_path, start, end, output_path, ass_path=None):
+def cut_clip(video_path, start, end, output_path, ass_path=None,
+             mirror=False, speed_up=False):
     duration = end - start
-    filters = [
+    filters = []
+
+    if mirror:
+        filters.append("hflip")
+
+    if speed_up:
+        filters.append("setpts=0.95*PTS")
+
+    filters.extend([
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
-    ]
+    ])
+
     if ass_path and os.path.exists(ass_path):
         ass_abs = str(Path(ass_path).resolve())
         ass_escaped = ass_abs.replace("\\", "/").replace(":", "\\:")
         filters.append(f"ass='{ass_escaped}'")
 
-    cmd = [
-        "ffmpeg", "-i", video_path,
-        "-ss", str(start), "-t", str(duration),
+    cmd = ["ffmpeg", "-i", video_path, "-ss", str(start), "-t", str(duration)]
+
+    if speed_up:
+        cmd += ["-filter:a", "atempo=1.05"]
+
+    cmd += [
         "-vf", ",".join(filters),
         "-c:v", "libx264", "-preset", "fast",
         "-c:a", "aac", "-y", output_path,
     ]
+
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         return output_path
@@ -320,29 +323,25 @@ def generate_thumb(video_path: str, output_path: str, at: float = 0.5):
         return None
 
 
-def run_pipeline_with_task(task_id: str, url: str, plan: str, user_id: str):
+def run_pipeline_with_task(task_id: str, source_path: str, plan: str, user_id: str,
+                            mirror: bool = False, speed_up: bool = False,
+                            subtitles: bool = True):
     plan_config = PLANS.get(plan, PLANS["free"])
     max_clip_duration = plan_config["max_clip_duration"]
     use_watermark = plan_config["watermark"]
-    kinetic_subs = plan_config["kinetic_subs"]
+    kinetic_subs = plan_config["kinetic_subs"] and subtitles
+    max_clips = plan_config["max_clips"]
+
+    video_path = source_path
 
     try:
-        update_task(task_id, status="processing", progress=5, stage="Проверяю видео...")
-
-        pre_duration = check_duration_before_download(url)
-        if pre_duration > MAX_VIDEO_DURATION:
-            raise PipelineError(
-                f"Видео длиннее {MAX_VIDEO_DURATION // 60} минут. Выбери другое."
-            )
-
-        update_task(task_id, progress=15, stage="Скачиваю видео...")
-        video_path = str(TEMP_DIR / "source.mp4")
-        download_video(url, video_path)
+        update_task(task_id, status="processing", progress=15, stage="Анализирую видео...")
 
         video_duration = get_video_duration(video_path)
         log_info(f"[task {task_id}] Длина видео: {video_duration:.1f}с")
 
-        num_clips = calculate_num_clips(video_duration, max_clip_duration)
+        num_clips = calculate_num_clips(video_duration, max_clips)
+        log_info(f"[task {task_id}] Клипов будет: {num_clips}")
 
         update_task(task_id, progress=30, stage="Транскрибирую...")
         result = transcribe(video_path)
@@ -363,9 +362,14 @@ def run_pipeline_with_task(task_id: str, url: str, plan: str, user_id: str):
             ass_path = str(TEMP_DIR / f"clip_{i+1}.ass")
             thumb_path = str(TEMP_DIR / f"clip_{i+1}.jpg")
 
-            generate_ass(segments, ass_path, moment["start"], moment["end"],
-                         use_watermark=use_watermark, kinetic_subs=kinetic_subs)
-            cut_clip(video_path, moment["start"], moment["end"], output, ass_path)
+            if kinetic_subs:
+                generate_ass(segments, ass_path, moment["start"], moment["end"],
+                             use_watermark=use_watermark, kinetic_subs=True)
+            else:
+                ass_path = None
+
+            cut_clip(video_path, moment["start"], moment["end"], output, ass_path,
+                     mirror=mirror, speed_up=speed_up)
             generate_thumb(output, thumb_path, at=0.5)
 
             clip_minutes = (moment["end"] - moment["start"]) / 60
@@ -374,7 +378,7 @@ def run_pipeline_with_task(task_id: str, url: str, plan: str, user_id: str):
             progress = 75 + int((i + 1) / len(moments) * 20)
             update_task(task_id, progress=progress, stage=f"Клип {i+1}/{len(moments)}")
 
-            clip_db = create_user_clip(
+            create_user_clip(
                 user_id=user_id,
                 task_id=task_id,
                 title=moment["title"],
@@ -383,8 +387,6 @@ def run_pipeline_with_task(task_id: str, url: str, plan: str, user_id: str):
                 filename=f"clip_{i+1}.mp4",
                 thumb_filename=f"clip_{i+1}.jpg" if os.path.exists(thumb_path) else None,
             )
-            if clip_db is None:
-                log_error(f"[task {task_id}] Не удалось сохранить клип {i+1} в БД")
 
             clips.append({
                 "id": i + 1,
@@ -395,7 +397,7 @@ def run_pipeline_with_task(task_id: str, url: str, plan: str, user_id: str):
                 "thumb": thumb_path,
             })
 
-        add_used_minutes(user_id, total_minutes)
+        add_used_minutes(user_id, video_duration / 60)
 
         update_task(
             task_id,
@@ -405,11 +407,18 @@ def run_pipeline_with_task(task_id: str, url: str, plan: str, user_id: str):
             clips=clips,
         )
 
-        log_info(f"[task {task_id}] Завершено. Клипов: {len(clips)}, минут: {total_minutes:.1f}")
+        log_info(f"[task {task_id}] Завершено. Клипов: {len(clips)}")
 
     except PipelineError as e:
         log_error(f"[task {task_id}] PipelineError: {e}")
         update_task(task_id, status="error", error=str(e), stage="Ошибка")
     except Exception as e:
         log_error(f"[task {task_id}] Ошибка: {e}")
-        update_task(task_id, status="error", error="Внутренняя ошибка сервера", stage="Ошибка")
+        update_task(task_id, status="error", error="Внутренняя ошибка", stage="Ошибка")
+    finally:
+        try:
+            if os.path.exists(video_path) and str(UPLOAD_DIR) in video_path:
+                os.remove(video_path)
+                log_info(f"[task {task_id}] Исходник удалён")
+        except Exception:
+            pass
