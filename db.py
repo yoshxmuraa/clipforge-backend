@@ -209,13 +209,17 @@ def delete_user_clips(user_id: str, clip_ids: list):
     try:
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        # Получаем имена файлов перед удалением
         cur.execute(
-            "select filename, thumb_filename from user_clips where user_id = %s and id = any(%s)",
+            "select filename, thumb_filename from user_clips where user_id = %s and id::text = any(%s)",
             (user_id, clip_ids),
         )
         rows = cur.fetchall()
+        
+        # Удаляем записи
         cur.execute(
-            "delete from user_clips where user_id = %s and id = any(%s)",
+            "delete from user_clips where user_id = %s and id::text = any(%s)",
             (user_id, clip_ids),
         )
         conn.commit()

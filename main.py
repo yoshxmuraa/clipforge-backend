@@ -262,8 +262,16 @@ def list_user_clips(authorization: Optional[str] = Header(None)):
 @app.delete("/clips")
 def delete_clips(req: DeleteClipsRequest, authorization: Optional[str] = Header(None)):
     payload = get_current_user(authorization)
+    
+    # Удаляем из БД
     rows = delete_user_clips(payload["sub"], req.clip_ids)
 
+    if not rows:
+        # Если ничего не удалилось, но запрос пришел — возможно, ID не найдены
+        log_error(f"[api] Не удалось удалить клипы: {req.clip_ids}")
+        return {"deleted": 0, "message": "Клипы не найдены или уже удалены"}
+
+    # Удаляем файлы с диска
     for r in rows:
         f = TEMP_DIR / r["filename"]
         if f.exists():
@@ -273,6 +281,7 @@ def delete_clips(req: DeleteClipsRequest, authorization: Optional[str] = Header(
             if t.exists():
                 t.unlink()
 
+    log_info(f"[api] Удалено клипов: {len(rows)}")
     return {"deleted": len(rows)}
 
 
@@ -281,7 +290,12 @@ def get_clip(filename: str):
     path = TEMP_DIR / Path(filename).name
     if not path.exists():
         raise HTTPException(status_code=404, detail="Clip not found")
-    return FileResponse(path, media_type="video/mp4")
+    
+    return FileResponse(
+        path, 
+        media_type="video/mp4", 
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 
 @app.get("/thumb/{filename}")

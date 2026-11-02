@@ -199,8 +199,7 @@ def format_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def generate_ass(segments, output_path, clip_start, clip_end,
-                 use_watermark=False, kinetic_subs=True):
+def generate_ass(segments, output_path, clip_start, clip_end, use_watermark=False):
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -210,7 +209,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,80,80,300,1
+Style: Default,Arial Black,64,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,2,80,80,400,1
 Style: Watermark,Arial,56,&H50FFFFFF,&H50FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,9,40,40,40,1
 
 [Events]
@@ -224,41 +223,53 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"Dialogue: 0,0:00:00.00,{format_ass_time(total_duration)},Watermark,,0,0,0,,SonarClip"
         )
 
-    if not kinetic_subs:
-        return output_path
-
     for seg in segments:
         if seg["end"] <= clip_start or seg["start"] >= clip_end:
             continue
         if "words" not in seg or not seg["words"]:
             continue
 
-        words = [
-            w for w in seg["words"]
-            if w["end"] > clip_start and w["start"] < clip_end
-        ]
+        words = []
+        for w in seg["words"]:
+            if w["end"] > clip_start and w["start"] < clip_end:
+                w_start = max(w["start"], clip_start) - clip_start
+                w_end = min(w["end"], clip_end) - clip_start
+                
+                if w_end - w_start < 0.1:
+                    w_end = w_start + 0.1
+                
+                words.append({
+                    "word": w["word"].strip().upper(),
+                    "start": w_start,
+                    "end": w_end
+                })
+
         if not words:
             continue
 
-        for i in range(0, len(words), 2):
-            group = words[i:i + 2]
+        group_size = 2 
+        for i in range(0, len(words), group_size):
+            group = words[i:i + group_size]
             if not group:
                 continue
+
             for j, active in enumerate(group):
-                w_start = max(active["start"], clip_start) - clip_start
-                w_end = min(active["end"], clip_end) - clip_start
+                w_start = active["start"]
+                w_end = active["end"]
 
                 parts = []
                 for k, w in enumerate(group):
-                    t = w["word"].strip().upper()
+                    t = w["word"]
                     if k == j:
                         parts.append(f"{{\\c&H00FFFF&\\fscx115\\fscy115}}{t}{{\\r}}")
                     else:
                         parts.append(t)
 
+                text = " ".join(parts)
+
                 events.append(
                     f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},"
-                    f"Default,,0,0,0,,{' '.join(parts)}"
+                    f"Default,,0,0,0,,{text}"
                 )
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -329,7 +340,6 @@ def run_pipeline_with_task(task_id: str, source_path: str, plan: str, user_id: s
     plan_config = PLANS.get(plan, PLANS["free"])
     max_clip_duration = plan_config["max_clip_duration"]
     use_watermark = plan_config["watermark"]
-    kinetic_subs = plan_config["kinetic_subs"] and subtitles
     max_clips = plan_config["max_clips"]
 
     video_path = source_path
@@ -362,9 +372,9 @@ def run_pipeline_with_task(task_id: str, source_path: str, plan: str, user_id: s
             ass_path = str(TEMP_DIR / f"clip_{i+1}.ass")
             thumb_path = str(TEMP_DIR / f"clip_{i+1}.jpg")
 
-            if kinetic_subs:
+            if subtitles:
                 generate_ass(segments, ass_path, moment["start"], moment["end"],
-                             use_watermark=use_watermark, kinetic_subs=True)
+                             use_watermark=use_watermark)
             else:
                 ass_path = None
 
