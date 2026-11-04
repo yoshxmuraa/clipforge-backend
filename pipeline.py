@@ -3,6 +3,7 @@ import subprocess
 import json
 import time
 import base64
+import shutil
 from openai import OpenAI
 from pathlib import Path
 from logger import log_info, log_error, log_warning
@@ -118,9 +119,15 @@ def transcribe(video_path: str):
 
     from whisper import load_model
     model = load_model("base")
-    result = model.transcribe(video_path, word_timestamps=True)
+    
+    result = model.transcribe(
+        video_path, 
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        language="ru" 
+    )
 
-    log_info(f"[transcribe] Готово за {time.time()-start:.1f}с")
+    log_info(f"[transcribe] Готово за {time.time()-start:.1f}с, сегментов: {len(result['segments'])}")
     return result
 
 
@@ -223,58 +230,72 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"Dialogue: 0,0:00:00.00,{format_ass_time(total_duration)},Watermark,,0,0,0,,SonarClip"
         )
 
+    all_words = []
     for seg in segments:
-        if seg["end"] <= clip_start or seg["start"] >= clip_end:
-            continue
         if "words" not in seg or not seg["words"]:
             continue
-
-        words = []
+        
         for w in seg["words"]:
             if w["end"] > clip_start and w["start"] < clip_end:
                 w_start = max(w["start"], clip_start) - clip_start
                 w_end = min(w["end"], clip_end) - clip_start
                 
-                if w_end - w_start < 0.1:
-                    w_end = w_start + 0.1
-                
-                words.append({
+                all_words.append({
                     "word": w["word"].strip().upper(),
                     "start": w_start,
                     "end": w_end
                 })
 
-        if not words:
+    all_words.sort(key=lambda x: x["start"])
+
+    log_info(f"[ass] Найдено слов для клипа: {len(all_words)}")
+
+    if not all_words:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(header)
+        return output_path
+
+    for i in range(len(all_words)):
+        if all_words[i]["end"] - all_words[i]["start"] < 0.25:
+            all_words[i]["end"] = all_words[i]["start"] + 0.25
+        
+        if i < len(all_words) - 1:
+            next_start = all_words[i+1]["start"]
+            if all_words[i]["end"] > next_start:
+                all_words[i]["end"] = next_start
+            if next_start - all_words[i]["end"] > 0.5:
+                all_words[i]["end"] = all_words[i]["start"] + 0.5
+
+    group_size = 2
+    for i in range(0, len(all_words), group_size):
+        group = all_words[i:i + group_size]
+        if not group:
             continue
 
-        group_size = 2 
-        for i in range(0, len(words), group_size):
-            group = words[i:i + group_size]
-            if not group:
-                continue
+        for j, active in enumerate(group):
+            w_start = active["start"]
+            w_end = active["end"]
 
-            for j, active in enumerate(group):
-                w_start = active["start"]
-                w_end = active["end"]
+            parts = []
+            for k, w in enumerate(group):
+                t = w["word"]
+                if k == j:
+                    parts.append(f"{{\\c&H00FFFF&\\fscx115\\fscy115}}{t}{{\\r}}")
+                else:
+                    parts.append(t)
 
-                parts = []
-                for k, w in enumerate(group):
-                    t = w["word"]
-                    if k == j:
-                        parts.append(f"{{\\c&H00FFFF&\\fscx115\\fscy115}}{t}{{\\r}}")
-                    else:
-                        parts.append(t)
+            text = " ".join(parts)
 
-                text = " ".join(parts)
-
-                events.append(
-                    f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},"
-                    f"Default,,0,0,0,,{text}"
-                )
+            events.append(
+                f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},"
+                f"Default,,0,0,0,,{text}"
+            )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(header)
         f.write("\n".join(events))
+    
+    log_info(f"[ass] Сгенерировано событий: {len(events)}")
     return output_path
 
 
@@ -294,20 +315,37 @@ def cut_clip(video_path, start, end, output_path, ass_path=None,
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
     ])
 
-    if ass_path and os.path.exists(ass_path):
-        ass_abs = str(Path(ass_path).resolve())
+    if ass_path and os.path.exists(ass_path) and os.path.getsize(ass_path) > 100:
+        simple_ass_path = f"C:\\temp\\{os.path.basename(ass_path)}"
+        os.makedirs("C:\\temp", exist_ok=True)
+        shutil.copy(ass_path, simple_ass_path)
+        
+        ass_abs = str(Path(simple_ass_path).resolve())
         ass_escaped = ass_abs.replace("\\", "/").replace(":", "\\:")
         filters.append(f"ass='{ass_escaped}'")
+        log_info(f"[ffmpeg] Субтитры накладываются из {ass_escaped}")
+    else:
+        log_info(f"[ffmpeg] Субтитры НЕ накладываются (файл пуст или отсутствует)")
 
-    cmd = ["ffmpeg", "-i", video_path, "-ss", str(start), "-t", str(duration)]
+    cmd = ["ffmpeg", "-ss", str(start), "-i", video_path, "-t", str(duration)]
 
     if speed_up:
         cmd += ["-filter:a", "atempo=1.05"]
 
     cmd += [
         "-vf", ",".join(filters),
-        "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac", "-y", output_path,
+        "-c:v", "libx264", 
+        "-preset", "fast",
+        "-crf", "23",
+        "-g", "30",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-y",
+        "-map_metadata", "-1",
+        "-metadata", "encoder=CapCut",
+        "-metadata", "software=CapCut",
+        output_path,
     ]
 
     try:
@@ -343,6 +381,7 @@ def run_pipeline_with_task(task_id: str, source_path: str, plan: str, user_id: s
     max_clips = plan_config["max_clips"]
 
     video_path = source_path
+    unique_prefix = str(int(time.time()))
 
     try:
         update_task(task_id, status="processing", progress=15, stage="Анализирую видео...")
@@ -368,9 +407,13 @@ def run_pipeline_with_task(task_id: str, source_path: str, plan: str, user_id: s
         total_minutes = 0.0
 
         for i, moment in enumerate(moments):
-            output = str(TEMP_DIR / f"clip_{i+1}.mp4")
-            ass_path = str(TEMP_DIR / f"clip_{i+1}.ass")
-            thumb_path = str(TEMP_DIR / f"clip_{i+1}.jpg")
+            clip_filename = f"clip_{unique_prefix}_{i+1}.mp4"
+            ass_filename = f"clip_{unique_prefix}_{i+1}.ass"
+            thumb_filename = f"clip_{unique_prefix}_{i+1}.jpg"
+
+            output = str(TEMP_DIR / clip_filename)
+            ass_path = str(TEMP_DIR / ass_filename)
+            thumb_path = str(TEMP_DIR / thumb_filename)
 
             if subtitles:
                 generate_ass(segments, ass_path, moment["start"], moment["end"],
@@ -394,8 +437,8 @@ def run_pipeline_with_task(task_id: str, source_path: str, plan: str, user_id: s
                 title=moment["title"],
                 start_time=moment["start"],
                 end_time=moment["end"],
-                filename=f"clip_{i+1}.mp4",
-                thumb_filename=f"clip_{i+1}.jpg" if os.path.exists(thumb_path) else None,
+                filename=clip_filename,
+                thumb_filename=thumb_filename if os.path.exists(thumb_path) else None,
             )
 
             clips.append({
