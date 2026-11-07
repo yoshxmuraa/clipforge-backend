@@ -4,15 +4,27 @@ import json
 import time
 import base64
 import shutil
-import imageio_ffmpeg
 from openai import OpenAI
 from pathlib import Path
 from logger import log_info, log_error, log_warning
 from db import update_task, add_used_minutes, create_user_clip
 
-# Настройка пути к FFmpeg для Railway (где нет системного ffmpeg)
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
+# 1. Поиск FFmpeg (для Railway и локальной разработки)
+FFMPEG_EXE = "ffmpeg" # По умолчанию
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
+    log_info(f"[init] FFmpeg найден через imageio: {FFMPEG_EXE}")
+except Exception as e:
+    log_warning(f"[init] imageio-ffmpeg не сработал: {e}")
+    # Пробуем найти системный
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        FFMPEG_EXE = system_ffmpeg
+        log_info(f"[init] Использую системный FFmpeg: {FFMPEG_EXE}")
+    else:
+        log_error("[init] FFmpeg НЕ НАЙДЕН В СИСТЕМЕ!")
 
 TEMP_DIR = Path("/tmp/sonarclip_temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
