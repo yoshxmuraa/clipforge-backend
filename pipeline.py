@@ -10,8 +10,9 @@ from pathlib import Path
 from logger import log_info, log_error, log_warning
 from db import update_task, add_used_minutes, create_user_clip
 
-# Настройка пути к FFmpeg для Railway (где нет системного ffprobe)
-os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
+# Настройка пути к FFmpeg для Railway (где нет системного ffmpeg)
+FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
 
 TEMP_DIR = Path("/tmp/sonarclip_temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,11 +106,9 @@ def download_video(url: str, output_path: str):
 
 def get_video_duration(video_path: str) -> float:
     try:
-        ffmpeg_exe = os.environ.get("IMAGEIO_FFMPEG_EXE", "ffmpeg")
-        cmd = [ffmpeg_exe, "-i", video_path]
+        cmd = [FFMPEG_EXE, "-i", video_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         
-        # FFmpeg выводит инфу в stderr, ищем строку Duration
         for line in result.stderr.split('\n'):
             if 'Duration:' in line:
                 time_str = line.split('Duration:')[1].split(',')[0].strip()
@@ -335,8 +334,7 @@ def cut_clip(video_path, start, end, output_path, ass_path=None,
     else:
         log_info(f"[ffmpeg] Субтитры НЕ накладываются (файл пуст или отсутствует)")
 
-    ffmpeg_exe = os.environ.get("IMAGEIO_FFMPEG_EXE", "ffmpeg")
-    cmd = [ffmpeg_exe, "-ss", str(start), "-i", video_path, "-t", str(duration)]
+    cmd = [FFMPEG_EXE, "-ss", str(start), "-i", video_path, "-t", str(duration)]
 
     if speed_up:
         cmd += ["-filter:a", "atempo=1.05"]
@@ -367,9 +365,8 @@ def cut_clip(video_path, start, end, output_path, ass_path=None,
 
 
 def generate_thumb(video_path: str, output_path: str, at: float = 0.5):
-    ffmpeg_exe = os.environ.get("IMAGEIO_FFMPEG_EXE", "ffmpeg")
     cmd = [
-        ffmpeg_exe, "-i", video_path,
+        FFMPEG_EXE, "-i", video_path,
         "-ss", str(at),
         "-vframes", "1",
         "-vf", "scale=360:640",
