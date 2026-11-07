@@ -4,10 +4,14 @@ import json
 import time
 import base64
 import shutil
+import imageio_ffmpeg
 from openai import OpenAI
 from pathlib import Path
 from logger import log_info, log_error, log_warning
 from db import update_task, add_used_minutes, create_user_clip
+
+# Настройка пути к FFmpeg для Railway (где нет системного ffprobe)
+os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
 
 TEMP_DIR = Path("/tmp/sonarclip_temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -100,16 +104,20 @@ def download_video(url: str, output_path: str):
 
 
 def get_video_duration(video_path: str) -> float:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
     try:
-        return float(result.stdout.strip())
-    except:
+        ffmpeg_exe = os.environ.get("IMAGEIO_FFMPEG_EXE", "ffmpeg")
+        cmd = [ffmpeg_exe, "-i", video_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # FFmpeg выводит инфу в stderr, ищем строку Duration
+        for line in result.stderr.split('\n'):
+            if 'Duration:' in line:
+                time_str = line.split('Duration:')[1].split(',')[0].strip()
+                h, m, s = time_str.split(':')
+                return int(h) * 3600 + int(m) * 60 + float(s)
+        return 0.0
+    except Exception as e:
+        log_error(f"[duration] Ошибка: {e}")
         return 0.0
 
 
@@ -327,7 +335,8 @@ def cut_clip(video_path, start, end, output_path, ass_path=None,
     else:
         log_info(f"[ffmpeg] Субтитры НЕ накладываются (файл пуст или отсутствует)")
 
-    cmd = ["ffmpeg", "-ss", str(start), "-i", video_path, "-t", str(duration)]
+    ffmpeg_exe = os.environ.get("IMAGEIO_FFMPEG_EXE", "ffmpeg")
+    cmd = [ffmpeg_exe, "-ss", str(start), "-i", video_path, "-t", str(duration)]
 
     if speed_up:
         cmd += ["-filter:a", "atempo=1.05"]
@@ -358,8 +367,9 @@ def cut_clip(video_path, start, end, output_path, ass_path=None,
 
 
 def generate_thumb(video_path: str, output_path: str, at: float = 0.5):
+    ffmpeg_exe = os.environ.get("IMAGEIO_FFMPEG_EXE", "ffmpeg")
     cmd = [
-        "ffmpeg", "-i", video_path,
+        ffmpeg_exe, "-i", video_path,
         "-ss", str(at),
         "-vframes", "1",
         "-vf", "scale=360:640",
