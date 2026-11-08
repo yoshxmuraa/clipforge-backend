@@ -9,22 +9,30 @@ from pathlib import Path
 from logger import log_info, log_error, log_warning
 from db import update_task, add_used_minutes, create_user_clip
 
-# 1. Поиск FFmpeg (для Railway и локальной разработки)
-FFMPEG_EXE = "ffmpeg" # По умолчанию
+# --- НАСТРОЙКА FFMPEG ДЛЯ RAILWAY ---
+FFMPEG_EXE = "ffmpeg"
 try:
     import imageio_ffmpeg
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
     os.environ["IMAGEIO_FFMPEG_EXE"] = FFMPEG_EXE
     log_info(f"[init] FFmpeg найден через imageio: {FFMPEG_EXE}")
+    
+    # Создаем симлинк, чтобы Whisper (который вызывает 'ffmpeg' напрямую) его увидел
+    if not os.path.exists("/usr/local/bin/ffmpeg"):
+        try:
+            os.symlink(FFMPEG_EXE, "/usr/local/bin/ffmpeg")
+            log_info("[init] Создан симлинк /usr/local/bin/ffmpeg")
+        except Exception as e:
+            log_warning(f"[init] Не удалось создать симлинк: {e}")
+            
 except Exception as e:
     log_warning(f"[init] imageio-ffmpeg не сработал: {e}")
-    # Пробуем найти системный
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
         FFMPEG_EXE = system_ffmpeg
         log_info(f"[init] Использую системный FFmpeg: {FFMPEG_EXE}")
     else:
-        log_error("[init] FFmpeg НЕ НАЙДЕН В СИСТЕМЕ!")
+        log_error("[init] FFmpeg НЕ НАЙДЕН!")
 
 TEMP_DIR = Path("/tmp/sonarclip_temp")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
