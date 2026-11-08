@@ -145,7 +145,7 @@ def transcribe(video_path: str):
     start = time.time()
 
     from whisper import load_model
-    model = load_model("base")
+    model = load_model("tiny")
     
     result = model.transcribe(
         video_path, 
